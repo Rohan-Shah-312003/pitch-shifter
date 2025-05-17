@@ -1,0 +1,5 @@
+- change pitch of audio - done
+- change playback speed of audio - done
+- keep the reading and writing on the same audio file - done
+- keep the continuous playback even after the rewriting of the file - pending
+- use mediapipe for input - pending
