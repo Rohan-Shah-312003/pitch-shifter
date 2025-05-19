@@ -5,50 +5,40 @@ import librosa
 import sounddevice as sd
 import pyrubberband as pyrb
 import numpy as np
+import time
 from queue import Queue, Empty
 
+# Setup MediaPipe and queues
 mp_drawing = mp.solutions.drawing_utils
 mp_hands = mp.solutions.hands
 
 cap = cv2.VideoCapture(0)
-
-prev_pitch = 0
-prev_rate = 1.0
-alpha = 0.31  # Smoothing factor: 0 < alpha < 1
-
 pitch_queue = Queue(maxsize=1)
 rate_queue = Queue(maxsize=1)
 
-# Load a sample audio clip
+# Load sample audio
 y_full, sr = librosa.load(librosa.example('brahms'), mono=True)
 chunk_size = 1024
-# chunk_size = 2048
 play_ptr = 0
 
-
-last_pitch = 0
-last_rate = 1.0
-
-def audio_callback(outdata, frames, time, status):
+# Audio callback
+def audio_callback(outdata, frames, time_info, status):
     global play_ptr
-    global last_pitch, last_rate
-
-    try:
-        pitch = pitch_queue.get_nowait()
-        last_pitch = 0.2 * pitch + 0.8 * last_pitch  # Smooth
-    except Empty:
-        pitch = last_pitch
-
-    try:
-        rate = rate_queue.get_nowait()
-        last_rate = 0.2 * rate + 0.8 * last_rate  # Smooth
-    except Empty:
-        rate = last_rate
-
     chunk = y_full[play_ptr:play_ptr+chunk_size]
+
     if len(chunk) < chunk_size:
         play_ptr = 0
     play_ptr += chunk_size
+
+    try:
+        pitch = pitch_queue.get_nowait()
+    except Empty:
+        pitch = 0
+
+    try:
+        rate = rate_queue.get_nowait()
+    except Empty:
+        rate = 1.0
 
     try:
         modified = pyrb.pitch_shift(chunk, sr, n_steps=pitch)
@@ -65,6 +55,7 @@ def audio_callback(outdata, frames, time, status):
         print(f"[Audio error] {e}")
         outdata[:] = chunk[:chunk_size].reshape(-1, 1)
 
+# Start audio stream
 stream = sd.OutputStream(
     samplerate=sr,
     blocksize=chunk_size,
@@ -73,12 +64,30 @@ stream = sd.OutputStream(
 )
 stream.start()
 
+# Utility: Draw bar
+def draw_bar(image, x, y, value, min_val, max_val, color, label):
+    bar_length = 200
+    norm_val = np.clip((value - min_val) / (max_val - min_val), 0, 1)
+    filled_length = int(norm_val * bar_length)
+
+    cv2.rectangle(image, (x, y), (x + bar_length, y + 20), (40, 40, 40), -1)
+    cv2.rectangle(image, (x, y), (x + filled_length, y + 20), color, -1)
+    cv2.putText(image, f"{label}: {value:.2f}", (x, y - 8),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
+# FPS setup
+prev_time = time.time()
+
+# Hand tracking
 with mp_hands.Hands(
     model_complexity=0,
     static_image_mode=False,
     max_num_hands=2,
     min_detection_confidence=0.5,
     min_tracking_confidence=0.5) as hands:
+
+    cv2.namedWindow("Hand-Controlled Pitch & Tempo", cv2.WINDOW_GUI_EXPANDED)
+
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
@@ -86,17 +95,23 @@ with mp_hands.Hands(
             continue
 
         frame = cv2.flip(frame, 1)
-        frame.flags.writeable = True 
+        frame.flags.writeable = True
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         results = hands.process(frame_rgb)
 
         pitch = 0
         rate = 1.0
 
+        overlay = frame.copy()
+        status_msg = "🤚 No hands detected"
+        colors = [(0, 255, 0), (255, 0, 0)]  # Green, Blue
+
         if results.multi_hand_landmarks:
+            status_msg = "🎵 Adjusting Pitch & Tempo"
+
             for hand_no, hand_landmarks in enumerate(results.multi_hand_landmarks, start=1):
                 mp_drawing.draw_landmarks(
-                    frame,
+                    overlay,
                     hand_landmarks,
                     mp_hands.HAND_CONNECTIONS)
 
@@ -109,32 +124,43 @@ with mp_hands.Hands(
                 dist = math.hypot(x2 - x1, y2 - y1) / 100
 
                 if hand_no == 1:
-                    raw_pitch = float(np.interp(dist, [1, 5], [-12, 12]))
-                    pitch = alpha * raw_pitch + (1 - alpha) * prev_pitch
-                    prev_pitch = pitch
-
+                    pitch = float(np.interp(dist, [1, 5], [-12, 12]))
                     pitch_queue.queue.clear()
                     pitch_queue.put(pitch)
                 else:
-                    raw_rate = float(np.interp(dist, [1, 5], [0.5, 2.0]))
-                    rate = alpha * raw_rate + (1 - alpha) * prev_rate
-                    prev_rate = rate
-
+                    rate = float(np.interp(dist, [1, 5], [0.5, 2.0]))
                     rate_queue.queue.clear()
                     rate_queue.put(rate)
 
-                cv2.circle(frame, (x1, y1), 10, (0, 255, 0), -1)
-                cv2.circle(frame, (x2, y2), 10, (0, 255, 0), -1)
-                cv2.putText(frame,
-                    f"Hand {hand_no} Dist: {dist:.1f}px",
-                    (10, 30 * hand_no),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    1, (0, 255, 0), 2)
+                # Draw finger points
+                cv2.circle(overlay, (x1, y1), 10, colors[hand_no - 1], -1)
+                cv2.circle(overlay, (x2, y2), 10, colors[hand_no - 1], -1)
+
+        # Transparent UI background
+        cv2.rectangle(overlay, (0, 0), (350, 160), (0, 0, 0), -1)
+        frame = cv2.addWeighted(overlay, 0.6, frame, 0.4, 0)
+
+        # Overlay text & bars
+        cv2.putText(frame, "🎧 Real-Time Audio Shifter", (10, 30),
+                    cv2.FONT_HERSHEY_DUPLEX, 1, (255, 255, 255), 2)
+        cv2.putText(frame, status_msg, (10, 60),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200, 200, 200), 2)
+
+        draw_bar(frame, 10, 90, pitch, -12, 12, (0, 255, 0), "Pitch")
+        draw_bar(frame, 10, 130, rate, 0.5, 2.0, (255, 0, 0), "Tempo")
+
+        # FPS
+        curr_time = time.time()
+        fps = 1 / (curr_time - prev_time)
+        prev_time = curr_time
+        cv2.putText(frame, f"FPS: {int(fps)}", (500, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
 
         cv2.imshow('Hand-Controlled Pitch & Tempo', frame)
         if cv2.waitKey(1) & 0xFF == 27:
             break
 
+# Cleanup
 cap.release()
 cv2.destroyAllWindows()
 stream.stop()
