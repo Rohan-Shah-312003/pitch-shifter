@@ -12,39 +12,48 @@ mp_hands = mp.solutions.hands
 
 cap = cv2.VideoCapture(0)
 
+prev_pitch = 0
+prev_rate = 1.0
+alpha = 0.31  # Smoothing factor: 0 < alpha < 1
+
 pitch_queue = Queue(maxsize=1)
 rate_queue = Queue(maxsize=1)
 
 # Load a sample audio clip
 y_full, sr = librosa.load(librosa.example('brahms'), mono=True)
 chunk_size = 1024
+# chunk_size = 2048
 play_ptr = 0
+
+
+last_pitch = 0
+last_rate = 1.0
 
 def audio_callback(outdata, frames, time, status):
     global play_ptr
-    chunk = y_full[play_ptr:play_ptr+chunk_size]
-
-    if len(chunk) < chunk_size:
-        play_ptr = 0
-        chunk = y_full[play_ptr:play_ptr+chunk_size]
-    play_ptr += chunk_size
+    global last_pitch, last_rate
 
     try:
         pitch = pitch_queue.get_nowait()
+        last_pitch = 0.2 * pitch + 0.8 * last_pitch  # Smooth
     except Empty:
-        pitch = 0
+        pitch = last_pitch
 
     try:
         rate = rate_queue.get_nowait()
+        last_rate = 0.2 * rate + 0.8 * last_rate  # Smooth
     except Empty:
-        rate = 1.0
+        rate = last_rate
 
-    # Stretch chunk to avoid mismatch in sample size
+    chunk = y_full[play_ptr:play_ptr+chunk_size]
+    if len(chunk) < chunk_size:
+        play_ptr = 0
+    play_ptr += chunk_size
+
     try:
         modified = pyrb.pitch_shift(chunk, sr, n_steps=pitch)
         modified = pyrb.time_stretch(modified, sr, rate)
 
-        # Fix size mismatch
         if len(modified) < chunk_size:
             modified = np.pad(modified, (0, chunk_size - len(modified)))
         else:
@@ -54,7 +63,6 @@ def audio_callback(outdata, frames, time, status):
 
     except Exception as e:
         print(f"[Audio error] {e}")
-        # Fallback to unmodified chunk
         outdata[:] = chunk[:chunk_size].reshape(-1, 1)
 
 stream = sd.OutputStream(
@@ -78,7 +86,7 @@ with mp_hands.Hands(
             continue
 
         frame = cv2.flip(frame, 1)
-        frame.flags.writeable = False
+        frame.flags.writeable = True 
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         results = hands.process(frame_rgb)
 
@@ -98,14 +106,20 @@ with mp_hands.Hands(
                 x1, y1 = int(thumb_tip.x * w), int(thumb_tip.y * h)
                 x2, y2 = int(idx_tip.x * w), int(idx_tip.y * h)
 
-                dist = math.hypot(x2 - x1, y2 - y1)
+                dist = math.hypot(x2 - x1, y2 - y1) / 100
 
                 if hand_no == 1:
-                    pitch = float(np.interp(dist, [20, 200], [-12, 12]))
+                    raw_pitch = float(np.interp(dist, [1, 5], [-12, 12]))
+                    pitch = alpha * raw_pitch + (1 - alpha) * prev_pitch
+                    prev_pitch = pitch
+
                     pitch_queue.queue.clear()
                     pitch_queue.put(pitch)
                 else:
-                    rate = float(np.interp(dist, [20, 200], [0.5, 2.0]))
+                    raw_rate = float(np.interp(dist, [1, 5], [0.5, 2.0]))
+                    rate = alpha * raw_rate + (1 - alpha) * prev_rate
+                    prev_rate = rate
+
                     rate_queue.queue.clear()
                     rate_queue.put(rate)
 
