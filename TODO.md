@@ -1,5 +1,9 @@
 - change pitch of audio - done
 - change playback speed of audio - done
 - keep the reading and writing on the same audio file - done
-- keep the continuous playback even after the rewriting of the file - pending
-- use mediapipe for input - pending
+- keep the continuous playback even after the rewriting of the file - done
+- use mediapipe for input - done
+- use fastapi for backend - pending
+- use uvicorn for running the backend - pending
+- setup nextjs - pending
+- use nextjs for frontend - pending
