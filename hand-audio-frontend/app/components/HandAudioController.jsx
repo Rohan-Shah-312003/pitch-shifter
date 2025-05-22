@@ -8,9 +8,11 @@ export default function HandAudioController() {
   const [rate, setRate] = useState(1.0);
   const [fps, setFps] = useState(0);
   const [error, setError] = useState(null);
+  const [audioError, setAudioError] = useState(null);
   
   const frameRef = useRef(null);
   const frameTimerRef = useRef(null);
+  const retryCountRef = useRef(0);
   
   // API endpoint configuration
   const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:5000';
@@ -20,6 +22,7 @@ export default function HandAudioController() {
     try {
       setIsLoading(true);
       setError(null);
+      setAudioError(null);
       
       const response = await fetch(`${API_BASE}/api/start`, {
         method: 'POST',
@@ -31,6 +34,8 @@ export default function HandAudioController() {
       if (data.status === 'started' || data.status === 'already_running') {
         setIsRunning(true);
         startFrameFetching();
+      } else if (data.status === 'error') {
+        setError(data.message || "Failed to start processing");
       } else {
         setError("Failed to start processing");
       }
@@ -66,6 +71,7 @@ export default function HandAudioController() {
         setPitch(0);
         setRate(1.0);
         setFps(0);
+        setAudioError(null);
       }
     } catch (err) {
       setError(`Error stopping backend: ${err.message}`);
@@ -97,9 +103,20 @@ export default function HandAudioController() {
         // Don't set error on failed frame, just log it
         if (response.status !== 404) { // Ignore "No frames available"
           console.error(`Error fetching frame: ${response.status}`);
+          
+          // After several failed attempts, consider the backend down
+          retryCountRef.current += 1;
+          if (retryCountRef.current > 50) { // After ~5 seconds of failures
+            setError("Connection to backend lost");
+            setIsRunning(false);
+            clearInterval(frameTimerRef.current);
+          }
         }
         return;
       }
+      
+      // Reset retry counter on successful fetch
+      retryCountRef.current = 0;
       
       const data = await response.json();
       
@@ -109,12 +126,21 @@ export default function HandAudioController() {
       setRate(data.rate);
       setFps(data.fps);
       
+      // Check for audio errors
+      if (data.audio_error) {
+        setAudioError(data.audio_error);
+      } else {
+        setAudioError(null);
+      }
+      
       // Update the image
       if (data.frame) {
         frameRef.current.src = `data:image/jpeg;base64,${data.frame}`;
       }
     } catch (err) {
       console.error("Error fetching frame:", err);
+      // Increment retry count but don't immediately stop on network errors
+      retryCountRef.current += 1;
     }
   };
   
@@ -172,6 +198,13 @@ export default function HandAudioController() {
         </div>
       )}
       
+      {audioError && (
+        <div className="w-full bg-yellow-100 border border-yellow-400 text-yellow-700 px-4 py-3 rounded mb-4">
+          <p className="font-bold">Audio Issue:</p>
+          <p>{audioError}</p>
+        </div>
+      )}
+      
       <div className="grid grid-cols-3 gap-4 w-full mb-6">
         <div className="bg-gray-100 p-4 rounded-lg text-center">
           <h2 className="font-semibold mb-1">Status</h2>
@@ -213,7 +246,16 @@ export default function HandAudioController() {
           <li><span className="font-semibold">First hand</span>: Control pitch with the distance between thumb and index finger</li>
           <li><span className="font-semibold">Second hand</span>: Control tempo with the distance between thumb and index finger</li>
           <li>Wider distances increase values, closer distances decrease values</li>
+          {audioError && (
+            <li className="text-red-600 font-bold">Note: There is an issue with audio playback. The visual hand tracking will still work.</li>
+          )}
         </ul>
+      </div>
+      
+      <div className="w-full mt-4 text-gray-600 text-sm">
+        <p className="text-center">
+          If you experience audio issues, try restarting the application or checking your audio device settings.
+        </p>
       </div>
     </div>
   );

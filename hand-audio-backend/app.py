@@ -12,6 +12,7 @@ from flask import Flask, Response, jsonify, request
 from flask_cors import CORS
 import threading
 import json
+import os
 
 app = Flask(__name__)
 CORS(app)  # Enable CORS for all routes
@@ -36,6 +37,8 @@ chunk_size = 2048
 play_ptr = 0
 stream = None
 audio_thread = None
+audio_loaded = False
+audio_error = None
 
 # Initialize hands detection
 hands = mp_hands.Hands(
@@ -47,31 +50,42 @@ hands = mp_hands.Hands(
 )
 
 def load_audio():
-    global y_full, sr
-    print("Loading audio sample...")
-    y_full, sr = librosa.load(librosa.example('brahms'), mono=True)
-    print("Audio loaded")
+    global y_full, sr, audio_loaded, audio_error
+    try:
+        print("Loading audio sample...")
+        y_full, sr = librosa.load(librosa.example('brahms'), mono=True, sr=None)
+        print(f"Audio loaded with sample rate: {sr}")
+        audio_loaded = True
+        audio_error = None
+    except Exception as e:
+        audio_error = f"Failed to load audio: {str(e)}"
+        print(audio_error)
+        audio_loaded = False
 
 def audio_callback(outdata, frames, time_info, status):
-    global play_ptr
-    chunk = y_full[play_ptr:play_ptr+chunk_size]
-
-    if len(chunk) < chunk_size:
-        play_ptr = 0
+    global play_ptr, audio_error
+    
+    if status:
+        print(f"Audio callback status: {status}")
+    
+    try:
         chunk = y_full[play_ptr:play_ptr+chunk_size]
-    play_ptr += chunk_size
 
-    try:
-        pitch = pitch_queue.get_nowait()
-    except Empty:
-        pitch = 0
+        if len(chunk) < chunk_size:
+            play_ptr = 0
+            chunk = y_full[play_ptr:play_ptr+chunk_size]
+        play_ptr += chunk_size
 
-    try:
-        rate = rate_queue.get_nowait()
-    except Empty:
-        rate = 1.0
+        try:
+            pitch = pitch_queue.get_nowait()
+        except Empty:
+            pitch = 0
 
-    try:
+        try:
+            rate = rate_queue.get_nowait()
+        except Empty:
+            rate = 1.0
+
         modified = pyrb.pitch_shift(chunk, sr, n_steps=pitch)
         modified = pyrb.time_stretch(modified, sr, rate)
 
@@ -83,28 +97,78 @@ def audio_callback(outdata, frames, time_info, status):
         outdata[:] = modified.reshape(-1, 1)
 
     except Exception as e:
-        print(f"[Audio error] {e}")
-        outdata[:] = chunk[:chunk_size].reshape(-1, 1)
+        audio_error = f"Audio processing error: {str(e)}"
+        print(audio_error)
+        # Provide silence if there's an error
+        outdata.fill(0)
+
+def get_valid_audio_device():
+    try:
+        devices = sd.query_devices()
+        print(f"Available audio devices: {devices}")
+        
+        # Try to find a valid output device
+        for i, device in enumerate(devices):
+            if device['max_output_channels'] > 0:
+                print(f"Selected output device: {device['name']}")
+                return i
+        
+        # If no specific device found, use default
+        return sd.default.device[1]  # Use default output device
+    except Exception as e:
+        print(f"Error querying audio devices: {e}")
+        return None
 
 def start_audio_stream():
-    global stream
-    if stream is None:
+    global stream, audio_error
+    
+    if stream is not None:
+        return  # Stream already started
+    
+    if not audio_loaded:
+        load_audio()
+    
+    if not audio_loaded:
+        return  # Audio failed to load
+    
+    try:
+        device = get_valid_audio_device()
+        print(f"Using audio device: {device}")
+        
+        # Create stream with robust error handling
         stream = sd.OutputStream(
             samplerate=sr,
             blocksize=chunk_size,
             channels=1,
-            callback=audio_callback
+            dtype='float32',
+            callback=audio_callback,
+            device=device
         )
+        
         stream.start()
-        print("Audio stream started")
+        audio_error = None
+        print("Audio stream started successfully")
+    except Exception as e:
+        audio_error = f"Failed to start audio stream: {str(e)}"
+        print(audio_error)
+        if stream is not None:
+            try:
+                stream.close()
+            except:
+                pass
+            stream = None
 
 def stop_audio_stream():
     global stream
     if stream is not None:
-        stream.stop()
-        stream.close()
-        stream = None
-        print("Audio stream stopped")
+        try:
+            stream.stop()
+            stream.close()
+        except Exception as e:
+            print(f"Error stopping audio stream: {e}")
+        finally:
+            stream = None
+            print("Audio stream stopped")
 
 def process_frame(frame):
     global pitch_value, rate_value, status_message, current_fps
@@ -172,6 +236,11 @@ def process_frame(frame):
     cv2.putText(result, f"FPS: {int(current_fps)}", (500, 30),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
     
+    # Audio status
+    if audio_error:
+        cv2.putText(result, "Audio Issue", (500, 60),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+    
     return result
 
 def draw_bar(image, x, y, value, min_val, max_val, color, label):
@@ -184,12 +253,29 @@ def draw_bar(image, x, y, value, min_val, max_val, color, label):
     cv2.putText(image, f"{label}: {value:.2f}", (x, y - 8),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
+def open_camera():
+    """Attempt to open the camera with error handling"""
+    for i in range(2):  # Try camera index 0 and 1
+        cap = cv2.VideoCapture(i)
+        if cap.isOpened():
+            print(f"Successfully opened camera at index {i}")
+            return cap
+    
+    # Fallback: try default camera
+    cap = cv2.VideoCapture(0)
+    if cap.isOpened():
+        print("Opened default camera")
+        return cap
+    
+    print("Error: Could not open any camera")
+    return None
+
 def video_processing_thread():
     global is_running, current_fps, frames_queue
     
-    cap = cv2.VideoCapture(0)
-    if not cap.isOpened():
-        print("Error: Could not open webcam")
+    cap = open_camera()
+    if cap is None:
+        is_running = False
         return
     
     prev_time = time.time()
@@ -199,7 +285,8 @@ def video_processing_thread():
             ret, frame = cap.read()
             if not ret:
                 print("Failed to grab frame")
-                break
+                time.sleep(0.5)  # Wait a bit before retrying
+                continue
                 
             processed_frame = process_frame(frame)
             
@@ -222,23 +309,32 @@ def video_processing_thread():
             
             # Don't run too fast
             time.sleep(0.01)
+    except Exception as e:
+        print(f"Error in video processing thread: {e}")
     finally:
-        cap.release()
+        if cap:
+            cap.release()
         print("Video capture released")
 
 @app.route('/api/start', methods=['POST'])
 def start_processing():
-    global is_running, audio_thread
+    global is_running, audio_thread, audio_error
     
     if is_running:
         return jsonify({"status": "already_running"})
     
     # Load audio if not loaded
-    if y_full is None:
+    if not audio_loaded:
         load_audio()
+    
+    if audio_error:
+        return jsonify({"status": "error", "message": audio_error}), 500
     
     # Start audio stream
     start_audio_stream()
+    
+    if audio_error:
+        return jsonify({"status": "error", "message": audio_error}), 500
     
     # Start video processing thread
     is_running = True
@@ -283,7 +379,8 @@ def get_frame():
             "status": status_message,
             "pitch": pitch_value,
             "rate": rate_value,
-            "fps": int(current_fps)
+            "fps": int(current_fps),
+            "audio_error": audio_error
         })
     except Empty:
         return jsonify({"error": "No frames available"}), 404
@@ -295,7 +392,9 @@ def get_status():
         "status": status_message,
         "pitch": pitch_value,
         "rate": rate_value,
-        "fps": int(current_fps)
+        "fps": int(current_fps),
+        "audio_loaded": audio_loaded,
+        "audio_error": audio_error
     })
 
 @app.route('/')
