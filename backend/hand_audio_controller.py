@@ -2,7 +2,7 @@ import cv2
 import mediapipe as mp
 import numpy as np
 import soundfile as sf
-import librosa
+import pyrubberband as pyrb
 import pygame
 import threading
 import time
@@ -19,10 +19,12 @@ import queue
 from collections import deque
 
 class RealTimeAudioProcessor:
-    def __init__(self, chunk_size=4096):
+    def __init__(self, chunk_size=2048):
         self.chunk_size = chunk_size
+        self.overlap_size = chunk_size // 4  # 25% overlap for smoother transitions
         self.audio_buffer = deque()
         self.processed_buffer = deque()
+        self.overlap_buffer = np.zeros(self.overlap_size)
         self.current_position = 0
         self.is_playing = False
         self.pitch_factor = 1.0
@@ -30,6 +32,12 @@ class RealTimeAudioProcessor:
         self.original_audio = None
         self.original_sr = None
         self.lock = threading.Lock()
+        
+        # Smoothing parameters for pyrubberband
+        self.pitch_smoothing = 0.1  # Lower = more responsive
+        self.tempo_smoothing = 0.1
+        self.smoothed_pitch = 1.0
+        self.smoothed_tempo = 1.0
         
     def load_audio(self, audio_data, sr):
         """Load audio data for real-time processing"""
@@ -39,9 +47,10 @@ class RealTimeAudioProcessor:
             self.current_position = 0
             self.audio_buffer.clear()
             self.processed_buffer.clear()
+            self.overlap_buffer = np.zeros(self.overlap_size)
             
-            # Split audio into chunks
-            for i in range(0, len(audio_data), self.chunk_size):
+            # Split audio into overlapping chunks for smoother processing
+            for i in range(0, len(audio_data), self.chunk_size - self.overlap_size):
                 chunk = audio_data[i:i + self.chunk_size]
                 if len(chunk) < self.chunk_size:
                     # Pad the last chunk
@@ -49,73 +58,95 @@ class RealTimeAudioProcessor:
                 self.audio_buffer.append(chunk)
     
     def update_parameters(self, pitch_factor, tempo_factor):
-        """Update audio parameters for real-time modification"""
+        """Update audio parameters with smoothing for real-time modification"""
         with self.lock:
-            self.pitch_factor = pitch_factor
-            self.tempo_factor = tempo_factor
+            # Apply exponential smoothing for stable parameter changes
+            self.smoothed_pitch = (self.pitch_smoothing * pitch_factor + 
+                                 (1 - self.pitch_smoothing) * self.smoothed_pitch)
+            self.smoothed_tempo = (self.tempo_smoothing * tempo_factor + 
+                                 (1 - self.tempo_smoothing) * self.smoothed_tempo)
+            
+            self.pitch_factor = self.smoothed_pitch
+            self.tempo_factor = self.smoothed_tempo
     
     def get_next_chunk(self):
-        """Get the next processed audio chunk"""
+        """Get the next processed audio chunk with overlap-add"""
         with self.lock:
             if not self.audio_buffer or self.current_position >= len(self.audio_buffer):
                 # Loop back to beginning
                 self.current_position = 0
+                self.overlap_buffer = np.zeros(self.overlap_size)
                 
             if self.current_position < len(self.audio_buffer):
-                chunk = self.audio_buffer[self.current_position]
+                chunk = self.audio_buffer[self.current_position].copy()
                 
-                # Apply real-time effects
+                # Apply real-time effects using pyrubberband
                 processed_chunk = self.apply_effects(chunk)
                 
+                # Apply overlap-add for smooth transitions
+                if self.current_position > 0:
+                    # Blend with overlap from previous chunk
+                    processed_chunk[:self.overlap_size] = (
+                        processed_chunk[:self.overlap_size] * 0.5 + 
+                        self.overlap_buffer * 0.5
+                    )
+                
+                # Store overlap for next chunk
+                self.overlap_buffer = processed_chunk[-self.overlap_size:].copy()
+                
                 self.current_position += 1
-                return processed_chunk
+                return processed_chunk[:-self.overlap_size]  # Remove overlap portion
             
-            return np.zeros(self.chunk_size)
+            return np.zeros(self.chunk_size - self.overlap_size)
     
     def apply_effects(self, chunk):
-        """Apply pitch and tempo effects to a chunk with overlap-add processing"""
+        """Apply pitch and tempo effects using pyrubberband"""
         try:
-            # Apply pitch shift with overlap-add
+            # Ensure chunk is the right type and has sufficient length
+            if len(chunk) < 512:  # Minimum length for pyrubberband
+                return chunk
+                
+            chunk = chunk.astype(np.float64)
+            
+            # Apply pitch shift if needed (pyrubberband is much more efficient)
             if abs(self.pitch_factor - 1.0) > 0.01:
-                semitones = 12 * np.log2(self.pitch_factor)
-                # Use a larger window for pitch shift
-                window_size = min(8192, len(chunk))
-                hop_size = window_size // 4
-                
-                # Split chunk into overlapping windows
-                windows = []
-                for i in range(0, len(chunk) - window_size + 1, hop_size):
-                    window = chunk[i:i + window_size]
-                    window = librosa.effects.pitch_shift(window, sr=self.original_sr, n_steps=semitones)
-                    windows.append(window)
-                
-                # Reconstruct using overlap-add
-                chunk = np.zeros(len(chunk))
-                for i, window in enumerate(windows):
-                    start_idx = i * hop_size
-                    chunk[start_idx:start_idx + window_size] += window
-                
-                # Normalize to prevent clipping
-                chunk /= np.max(np.abs(chunk))
+                # Convert pitch factor to semitones for pyrubberband
+                semitones = 12 * np.log2(max(0.1, self.pitch_factor))
+                try:
+                    chunk = pyrb.pitch_shift(chunk, self.original_sr, semitones)
+                except Exception as e:
+                    print(f"Pitch shift error: {e}")
+                    # Fallback: return original chunk if pyrubberband fails
+                    pass
             
-            # Apply tempo change with more accurate time stretching
+            # Apply tempo change if needed
             if abs(self.tempo_factor - 1.0) > 0.01:
-                # Use phase vocoder for better quality
-                chunk = librosa.phase_vocoder(librosa.stft(chunk), 
-                                            rate=self.tempo_factor, 
-                                            hop_length=512)
-                chunk = librosa.istft(chunk)
-                
-                # Adjust chunk size after time stretching
-                if len(chunk) > self.chunk_size:
-                    chunk = chunk[:self.chunk_size]
-                elif len(chunk) < self.chunk_size:
-                    chunk = np.pad(chunk, (0, self.chunk_size - len(chunk)), 'constant')
+                try:
+                    # Pyrubberband time stretch (much faster than librosa)
+                    stretch_factor = 1.0 / max(0.1, self.tempo_factor)
+                    chunk = pyrb.time_stretch(chunk, self.original_sr, stretch_factor)
+                    
+                    # Adjust chunk size after time stretching
+                    if len(chunk) > self.chunk_size:
+                        chunk = chunk[:self.chunk_size]
+                    elif len(chunk) < self.chunk_size:
+                        chunk = np.pad(chunk, (0, self.chunk_size - len(chunk)), 'constant')
+                        
+                except Exception as e:
+                    print(f"Time stretch error: {e}")
+                    # Fallback: return original chunk if pyrubberband fails
+                    pass
             
-            return chunk
+            # Normalize to prevent clipping and ensure good dynamic range
+            max_val = np.max(np.abs(chunk))
+            if max_val > 0:
+                chunk = chunk / max_val * 0.8  # Leave some headroom
+            
+            return chunk.astype(np.float32)
+            
         except Exception as e:
             print(f"Effect processing error: {e}")
-            return chunk
+            return chunk.astype(np.float32)
 
 class HandAudioController:
     def __init__(self):
@@ -124,17 +155,23 @@ class HandAudioController:
         self.hands = self.mp_hands.Hands(
             static_image_mode=False,
             max_num_hands=2,
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5
+            min_detection_confidence=0.7,
+            min_tracking_confidence=0.7
         )
         self.mp_draw = mp.solutions.drawing_utils
         
-        # Initialize pygame for audio playback
-        pygame.mixer.pre_init(frequency=22050, size=-16, channels=1, buffer=512)
+        # Initialize pygame for audio playback with better settings for real-time
+        pygame.mixer.pre_init(
+            frequency=22050, 
+            size=-16, 
+            channels=1, 
+            buffer=256  # Smaller buffer for lower latency
+        )
         pygame.mixer.init()
+        pygame.mixer.set_num_channels(8)  # More channels for smoother playback
         
-        # Real-time audio processor
-        self.audio_processor = RealTimeAudioProcessor(chunk_size=512)
+        # Real-time audio processor with optimized chunk size
+        self.audio_processor = RealTimeAudioProcessor(chunk_size=1024)
         
         # Audio parameters
         self.original_audio = None
@@ -142,21 +179,21 @@ class HandAudioController:
         self.audio_playing = False
         self.audio_thread = None
         
-        # Hand tracking parameters
+        # Hand tracking parameters with better smoothing
         self.left_hand_distance = 0.1
         self.right_hand_distance = 0.1
         self.pitch_factor = 1.0
         self.tempo_factor = 1.0
         
-        # Smoothing for parameters
-        self.pitch_history = deque(maxlen=5)
-        self.tempo_history = deque(maxlen=5)
+        # Enhanced smoothing for parameters
+        self.pitch_history = deque(maxlen=8)  # More history for smoother control
+        self.tempo_history = deque(maxlen=8)
         
-        # Distance ranges for mapping
-        self.min_distance = 0.02
-        self.max_distance = 0.15
-        self.pitch_range = (0.5, 2.0)
-        self.tempo_range = (0.5, 2.0)
+        # Improved distance ranges for better control
+        self.min_distance = 0.015  # Slightly smaller for more sensitivity
+        self.max_distance = 0.18   # Slightly larger for more range
+        self.pitch_range = (0.6, 1.8)  # More reasonable range
+        self.tempo_range = (0.6, 1.8)
         
         # Visualization
         self.fig, (self.ax1, self.ax2, self.ax3) = plt.subplots(3, 1, figsize=(12, 8))
@@ -171,20 +208,31 @@ class HandAudioController:
         self.cap = None
         self.camera_running = False
         
+        # Performance monitoring
+        self.frame_count = 0
+        self.last_fps_time = time.time()
+        self.fps = 0
+        
     def calculate_distance(self, point1, point2):
         """Calculate Euclidean distance between two points"""
         return np.sqrt((point1.x - point2.x)**2 + (point1.y - point2.y)**2)
     
     def map_distance_to_factor(self, distance, factor_range):
-        """Map normalized distance to a factor within the given range"""
+        """Map normalized distance to a factor within the given range with smoothing"""
         distance = max(self.min_distance, min(self.max_distance, distance))
+        # Use exponential mapping for more intuitive control
         normalized = (distance - self.min_distance) / (self.max_distance - self.min_distance)
+        # Apply slight curve for better control feel
+        normalized = normalized ** 0.8
         return factor_range[0] + normalized * (factor_range[1] - factor_range[0])
     
     def smooth_parameter(self, new_value, history):
-        """Apply smoothing to parameters for stable audio"""
+        """Apply enhanced smoothing to parameters for stable audio"""
         history.append(new_value)
-        return sum(history) / len(history)
+        # Use weighted average with more weight on recent values
+        weights = np.linspace(0.5, 1.0, len(history))
+        weights /= weights.sum()
+        return np.average(list(history), weights=weights)
     
     def process_hands(self, frame):
         """Process hand landmarks and update audio parameters"""
@@ -212,24 +260,47 @@ class HandAudioController:
                 # Update audio processor parameters in real-time
                 self.audio_processor.update_parameters(self.pitch_factor, self.tempo_factor)
                 
-                # Draw hand landmarks
-                self.mp_draw.draw_landmarks(frame, hand_landmarks, self.mp_hands.HAND_CONNECTIONS)
+                # Draw hand landmarks with better visualization
+                self.mp_draw.draw_landmarks(
+                    frame, hand_landmarks, self.mp_hands.HAND_CONNECTIONS,
+                    landmark_drawing_spec=mp.solutions.drawing_utils.DrawingSpec(
+                        color=(0, 255, 0), thickness=2, circle_radius=2
+                    ),
+                    connection_drawing_spec=mp.solutions.drawing_utils.DrawingSpec(
+                        color=(255, 255, 255), thickness=1
+                    )
+                )
                 
-                # Draw distance line
+                # Draw distance line with color coding
                 h, w, _ = frame.shape
                 thumb_pos = (int(thumb_tip.x * w), int(thumb_tip.y * h))
                 index_pos = (int(index_tip.x * w), int(index_tip.y * h))
-                cv2.line(frame, thumb_pos, index_pos, (0, 255, 0), 2)
                 
-                text = f"{hand_label}: {distance:.3f}"
+                # Color based on distance
+                color = (0, 255, 0) if distance < 0.05 else (0, 255, 255) if distance < 0.1 else (0, 0, 255)
+                cv2.line(frame, thumb_pos, index_pos, color, 3)
+                
+                # Enhanced text display
+                factor = self.pitch_factor if hand_label == "Left" else self.tempo_factor
+                param_name = "Pitch" if hand_label == "Left" else "Tempo"
+                text = f"{hand_label} {param_name}: {factor:.2f}x"
+                
+                # Background rectangle for better text visibility
+                text_size = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
+                cv2.rectangle(frame, 
+                            (thumb_pos[0] - 5, thumb_pos[1] - 35),
+                            (thumb_pos[0] + text_size[0] + 5, thumb_pos[1] - 10),
+                            (0, 0, 0), -1)
                 cv2.putText(frame, text, (thumb_pos[0], thumb_pos[1] - 20), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
         
         return frame
     
     def audio_playback_loop(self):
-        """Continuous audio playback loop with real-time modifications"""
-        print("Starting audio playback loop...")
+        """Optimized continuous audio playback loop"""
+        print("Starting optimized audio playback loop...")
+        channel_index = 0
+        max_channels = pygame.mixer.get_num_channels()
         
         while self.audio_playing:
             try:
@@ -237,37 +308,52 @@ class HandAudioController:
                 chunk = self.audio_processor.get_next_chunk()
                 
                 if chunk is not None and len(chunk) > 0:
-                    # Convert to pygame format
+                    # Convert to pygame format with better precision
                     chunk = np.clip(chunk, -1.0, 1.0)
                     chunk = (chunk * 32767).astype(np.int16)
                     
-                    # Create and play sound
+                    # Use round-robin channel assignment for smoother playback
                     try:
                         sound = pygame.sndarray.make_sound(chunk)
-                        channel = pygame.mixer.find_channel()
-                        if channel:
-                            channel.play(sound)
-                        else:
-                            # If no free channel, wait a bit
-                            time.sleep(0.01)
+                        pygame.mixer.Channel(channel_index).play(sound)
+                        channel_index = (channel_index + 1) % max_channels
                     except Exception as e:
                         print(f"Pygame sound error: {e}")
-                        time.sleep(0.01)
+                        time.sleep(0.005)
                 
-                # Control playback rate
-                time.sleep(0.02)  # ~50 FPS audio updates
+                # Faster update rate for smoother audio
+                time.sleep(0.01)  # ~100 FPS audio updates
                 
             except Exception as e:
                 print(f"Audio playback error: {e}")
-                time.sleep(0.1)
+                time.sleep(0.05)
         
         print("Audio playback loop stopped")
     
     def load_audio(self, audio_file):
-        """Load audio file"""
+        """Load audio file with better error handling"""
         try:
-            self.original_audio, self.original_sr = librosa.load(audio_file, sr=22050)
+            # Load audio with consistent sample rate
+            self.original_audio, self.original_sr = sf.read(audio_file)
+            
+            # Convert to mono if stereo
+            if len(self.original_audio.shape) > 1:
+                self.original_audio = np.mean(self.original_audio, axis=1)
+            
+            # Resample to 22050 Hz for consistency
+            if self.original_sr != 22050:
+                from scipy.signal import resample
+                target_length = int(len(self.original_audio) * 22050 / self.original_sr)
+                self.original_audio = resample(self.original_audio, target_length)
+                self.original_sr = 22050
+            
+            # Normalize audio
+            max_val = np.max(np.abs(self.original_audio))
+            if max_val > 0:
+                self.original_audio = self.original_audio / max_val * 0.8
+            
             self.audio_processor.load_audio(self.original_audio, self.original_sr)
+            print(f"Audio loaded: {len(self.original_audio)} samples at {self.original_sr} Hz")
             return True
         except Exception as e:
             print(f"Error loading audio: {e}")
@@ -282,8 +368,7 @@ class HandAudioController:
             return True
         
         self.audio_playing = True
-        self.audio_thread = threading.Thread(target=self.audio_playback_loop)
-        self.audio_thread.daemon = True
+        self.audio_thread = threading.Thread(target=self.audio_playback_loop, daemon=True)
         self.audio_thread.start()
         return True
     
@@ -291,12 +376,19 @@ class HandAudioController:
         """Stop audio playback"""
         self.audio_playing = False
         pygame.mixer.stop()
-        if self.audio_thread:
-            self.audio_thread.join(timeout=1.0)
+        if self.audio_thread and self.audio_thread.is_alive():
+            self.audio_thread.join(timeout=2.0)
     
     def update_visualization(self):
-        """Update real-time visualization"""
+        """Update real-time visualization with FPS display"""
         current_time = time.time()
+        
+        # Calculate FPS
+        self.frame_count += 1
+        if current_time - self.last_fps_time >= 1.0:
+            self.fps = self.frame_count / (current_time - self.last_fps_time)
+            self.frame_count = 0
+            self.last_fps_time = current_time
         
         try:
             self.time_data.put_nowait(current_time)
@@ -324,14 +416,14 @@ class HandAudioController:
             self.ax2.clear()
             self.ax3.clear()
             
-            self.ax1.plot(times, pitches, 'b-', linewidth=2, label='Pitch Factor')
+            self.ax1.plot(times, pitches, 'b-', linewidth=2, label='Pitch Factor', alpha=0.8)
             self.ax1.set_ylabel('Pitch Factor')
-            self.ax1.set_title('Real-time Audio Modifications')
+            self.ax1.set_title(f'Real-time Audio Modifications (FPS: {self.fps:.1f})')
             self.ax1.grid(True, alpha=0.3)
             self.ax1.legend()
             self.ax1.set_ylim(self.pitch_range[0] - 0.1, self.pitch_range[1] + 0.1)
             
-            self.ax2.plot(times, tempos, 'r-', linewidth=2, label='Tempo Factor')
+            self.ax2.plot(times, tempos, 'r-', linewidth=2, label='Tempo Factor', alpha=0.8)
             self.ax2.set_ylabel('Tempo Factor')
             self.ax2.grid(True, alpha=0.3)
             self.ax2.legend()
@@ -340,8 +432,8 @@ class HandAudioController:
             left_distances = [self.left_hand_distance] * len(times)
             right_distances = [self.right_hand_distance] * len(times)
             
-            self.ax3.plot(times, left_distances, 'g-', linewidth=2, label='Left Hand Distance')
-            self.ax3.plot(times, right_distances, 'm-', linewidth=2, label='Right Hand Distance')
+            self.ax3.plot(times, left_distances, 'g-', linewidth=2, label='Left Hand Distance', alpha=0.7)
+            self.ax3.plot(times, right_distances, 'm-', linewidth=2, label='Right Hand Distance', alpha=0.7)
             self.ax3.set_xlabel('Time (seconds)')
             self.ax3.set_ylabel('Hand Distance')
             self.ax3.grid(True, alpha=0.3)
@@ -356,10 +448,23 @@ class HandAudioController:
         return plot_data
     
     def start_camera(self):
-        """Start camera capture"""
-        self.cap = cv2.VideoCapture(0)
-        self.camera_running = True
-        return self.cap.isOpened()
+        """Start camera capture with better settings"""
+        try:
+            self.cap = cv2.VideoCapture(0)
+            if not self.cap.isOpened():
+                return False
+            
+            # Optimize camera settings for better performance
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            self.cap.set(cv2.CAP_PROP_FPS, 30)
+            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Reduce buffer for lower latency
+            
+            self.camera_running = True
+            return True
+        except Exception as e:
+            print(f"Error starting camera: {e}")
+            return False
     
     def stop_camera(self):
         """Stop camera capture"""
@@ -368,7 +473,7 @@ class HandAudioController:
             self.cap.release()
     
     def get_frame(self):
-        """Get processed camera frame"""
+        """Get processed camera frame with performance optimizations"""
         if not self.cap or not self.camera_running:
             return None
         
@@ -376,18 +481,29 @@ class HandAudioController:
         if not ret:
             return None
         
+        # Flip frame horizontally for mirror effect
+        frame = cv2.flip(frame, 1)
+        
         processed_frame = self.process_hands(frame)
         
+        # Enhanced info display
         info_text = [
             f"Pitch Factor: {self.pitch_factor:.2f} (Left Hand)",
-            f"Tempo Factor: {self.tempo_factor:.2f} (Right Hand)",
+            f"Tempo Factor: {self.tempo_factor:.2f} (Right Hand)", 
             f"Left Distance: {self.left_hand_distance:.3f}",
             f"Right Distance: {self.right_hand_distance:.3f}",
-            f"Audio Playing: {'Yes' if self.audio_playing else 'No'}"
+            f"Audio Playing: {'Yes' if self.audio_playing else 'No'}",
+            f"FPS: {self.fps:.1f}"
         ]
         
         for i, text in enumerate(info_text):
-            cv2.putText(processed_frame, text, (10, 30 + i * 25), 
+            # Background for better visibility
+            text_size = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
+            cv2.rectangle(processed_frame, 
+                        (5, 25 + i * 30), 
+                        (15 + text_size[0], 45 + i * 30),
+                        (0, 0, 0), -1)
+            cv2.putText(processed_frame, text, (10, 40 + i * 30), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
         
         return processed_frame
@@ -479,7 +595,7 @@ def generate_frames():
     while controller.camera_running:
         frame = controller.get_frame()
         if frame is not None:
-            ret, buffer = cv2.imencode('.jpg', frame)
+            ret, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
             if ret:
                 frame_bytes = buffer.tobytes()
                 yield (b'--frame\r\n'
@@ -502,7 +618,8 @@ def get_data():
             'pitch_factor': controller.pitch_factor,
             'tempo_factor': controller.tempo_factor,
             'audio_playing': controller.audio_playing,
-            'camera_running': controller.camera_running
+            'camera_running': controller.camera_running,
+            'fps': controller.fps
         }
         return jsonify(data)
     except Exception as e:
@@ -523,7 +640,8 @@ def health():
     return jsonify({'status': 'healthy'})
 
 if __name__ == '__main__':
-    print("Starting Real-time Hand Gesture Audio Controller Backend...")
+    print("Starting Optimized Real-time Hand Gesture Audio Controller Backend...")
+    print("Using pyrubberband for high-quality real-time audio processing")
     print("Available endpoints:")
     print("- POST /upload_audio - Upload audio file")
     print("- POST /start_audio - Start audio playback")
