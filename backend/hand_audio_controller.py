@@ -16,6 +16,106 @@ import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 import queue
+from collections import deque
+
+class RealTimeAudioProcessor:
+    def __init__(self, chunk_size=4096):
+        self.chunk_size = chunk_size
+        self.audio_buffer = deque()
+        self.processed_buffer = deque()
+        self.current_position = 0
+        self.is_playing = False
+        self.pitch_factor = 1.0
+        self.tempo_factor = 1.0
+        self.original_audio = None
+        self.original_sr = None
+        self.lock = threading.Lock()
+        
+    def load_audio(self, audio_data, sr):
+        """Load audio data for real-time processing"""
+        with self.lock:
+            self.original_audio = audio_data
+            self.original_sr = sr
+            self.current_position = 0
+            self.audio_buffer.clear()
+            self.processed_buffer.clear()
+            
+            # Split audio into chunks
+            for i in range(0, len(audio_data), self.chunk_size):
+                chunk = audio_data[i:i + self.chunk_size]
+                if len(chunk) < self.chunk_size:
+                    # Pad the last chunk
+                    chunk = np.pad(chunk, (0, self.chunk_size - len(chunk)), 'constant')
+                self.audio_buffer.append(chunk)
+    
+    def update_parameters(self, pitch_factor, tempo_factor):
+        """Update audio parameters for real-time modification"""
+        with self.lock:
+            self.pitch_factor = pitch_factor
+            self.tempo_factor = tempo_factor
+    
+    def get_next_chunk(self):
+        """Get the next processed audio chunk"""
+        with self.lock:
+            if not self.audio_buffer or self.current_position >= len(self.audio_buffer):
+                # Loop back to beginning
+                self.current_position = 0
+                
+            if self.current_position < len(self.audio_buffer):
+                chunk = self.audio_buffer[self.current_position]
+                
+                # Apply real-time effects
+                processed_chunk = self.apply_effects(chunk)
+                
+                self.current_position += 1
+                return processed_chunk
+            
+            return np.zeros(self.chunk_size)
+    
+    def apply_effects(self, chunk):
+        """Apply pitch and tempo effects to a chunk with overlap-add processing"""
+        try:
+            # Apply pitch shift with overlap-add
+            if abs(self.pitch_factor - 1.0) > 0.01:
+                semitones = 12 * np.log2(self.pitch_factor)
+                # Use a larger window for pitch shift
+                window_size = min(8192, len(chunk))
+                hop_size = window_size // 4
+                
+                # Split chunk into overlapping windows
+                windows = []
+                for i in range(0, len(chunk) - window_size + 1, hop_size):
+                    window = chunk[i:i + window_size]
+                    window = librosa.effects.pitch_shift(window, sr=self.original_sr, n_steps=semitones)
+                    windows.append(window)
+                
+                # Reconstruct using overlap-add
+                chunk = np.zeros(len(chunk))
+                for i, window in enumerate(windows):
+                    start_idx = i * hop_size
+                    chunk[start_idx:start_idx + window_size] += window
+                
+                # Normalize to prevent clipping
+                chunk /= np.max(np.abs(chunk))
+            
+            # Apply tempo change with more accurate time stretching
+            if abs(self.tempo_factor - 1.0) > 0.01:
+                # Use phase vocoder for better quality
+                chunk = librosa.phase_vocoder(librosa.stft(chunk), 
+                                            rate=self.tempo_factor, 
+                                            hop_length=512)
+                chunk = librosa.istft(chunk)
+                
+                # Adjust chunk size after time stretching
+                if len(chunk) > self.chunk_size:
+                    chunk = chunk[:self.chunk_size]
+                elif len(chunk) < self.chunk_size:
+                    chunk = np.pad(chunk, (0, self.chunk_size - len(chunk)), 'constant')
+            
+            return chunk
+        except Exception as e:
+            print(f"Effect processing error: {e}")
+            return chunk
 
 class HandAudioController:
     def __init__(self):
@@ -30,25 +130,33 @@ class HandAudioController:
         self.mp_draw = mp.solutions.drawing_utils
         
         # Initialize pygame for audio playback
-        pygame.mixer.init(frequency=22050, size=-16, channels=2, buffer=1024)
+        pygame.mixer.pre_init(frequency=22050, size=-16, channels=1, buffer=512)
+        pygame.mixer.init()
+        
+        # Real-time audio processor
+        self.audio_processor = RealTimeAudioProcessor(chunk_size=512)
         
         # Audio parameters
         self.original_audio = None
         self.original_sr = None
-        self.current_audio = None
         self.audio_playing = False
+        self.audio_thread = None
         
         # Hand tracking parameters
-        self.left_hand_distance = 0.1  # Default distance (normalized)
+        self.left_hand_distance = 0.1
         self.right_hand_distance = 0.1
-        self.pitch_factor = 1.0  # No pitch change initially
-        self.tempo_factor = 1.0  # No tempo change initially
+        self.pitch_factor = 1.0
+        self.tempo_factor = 1.0
+        
+        # Smoothing for parameters
+        self.pitch_history = deque(maxlen=5)
+        self.tempo_history = deque(maxlen=5)
         
         # Distance ranges for mapping
-        self.min_distance = 0.02  # Minimum finger distance
-        self.max_distance = 0.15  # Maximum finger distance
-        self.pitch_range = (0.5, 2.0)  # Pitch multiplier range
-        self.tempo_range = (0.5, 2.0)  # Tempo multiplier range
+        self.min_distance = 0.02
+        self.max_distance = 0.15
+        self.pitch_range = (0.5, 2.0)
+        self.tempo_range = (0.5, 2.0)
         
         # Visualization
         self.fig, (self.ax1, self.ax2, self.ax3) = plt.subplots(3, 1, figsize=(12, 8))
@@ -69,14 +177,14 @@ class HandAudioController:
     
     def map_distance_to_factor(self, distance, factor_range):
         """Map normalized distance to a factor within the given range"""
-        # Clamp distance to valid range
         distance = max(self.min_distance, min(self.max_distance, distance))
-        
-        # Normalize to 0-1
         normalized = (distance - self.min_distance) / (self.max_distance - self.min_distance)
-        
-        # Map to factor range
         return factor_range[0] + normalized * (factor_range[1] - factor_range[0])
+    
+    def smooth_parameter(self, new_value, history):
+        """Apply smoothing to parameters for stable audio"""
+        history.append(new_value)
+        return sum(history) / len(history)
     
     def process_hands(self, frame):
         """Process hand landmarks and update audio parameters"""
@@ -85,23 +193,24 @@ class HandAudioController:
         
         if results.multi_hand_landmarks and results.multi_handedness:
             for hand_landmarks, handedness in zip(results.multi_hand_landmarks, results.multi_handedness):
-                # Get hand label (Left or Right)
                 hand_label = handedness.classification[0].label
                 
-                # Get thumb tip and index finger tip
                 thumb_tip = hand_landmarks.landmark[self.mp_hands.HandLandmark.THUMB_TIP]
                 index_tip = hand_landmarks.landmark[self.mp_hands.HandLandmark.INDEX_FINGER_TIP]
                 
-                # Calculate distance
                 distance = self.calculate_distance(thumb_tip, index_tip)
                 
-                # Update parameters based on hand
                 if hand_label == "Left":
                     self.left_hand_distance = distance
-                    self.pitch_factor = self.map_distance_to_factor(distance, self.pitch_range)
+                    raw_pitch_factor = self.map_distance_to_factor(distance, self.pitch_range)
+                    self.pitch_factor = self.smooth_parameter(raw_pitch_factor, self.pitch_history)
                 elif hand_label == "Right":
                     self.right_hand_distance = distance
-                    self.tempo_factor = self.map_distance_to_factor(distance, self.tempo_range)
+                    raw_tempo_factor = self.map_distance_to_factor(distance, self.tempo_range)
+                    self.tempo_factor = self.smooth_parameter(raw_tempo_factor, self.tempo_history)
+                
+                # Update audio processor parameters in real-time
+                self.audio_processor.update_parameters(self.pitch_factor, self.tempo_factor)
                 
                 # Draw hand landmarks
                 self.mp_draw.draw_landmarks(frame, hand_landmarks, self.mp_hands.HAND_CONNECTIONS)
@@ -112,82 +221,88 @@ class HandAudioController:
                 index_pos = (int(index_tip.x * w), int(index_tip.y * h))
                 cv2.line(frame, thumb_pos, index_pos, (0, 255, 0), 2)
                 
-                # Add text with current values
                 text = f"{hand_label}: {distance:.3f}"
                 cv2.putText(frame, text, (thumb_pos[0], thumb_pos[1] - 20), 
                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
         
         return frame
     
-    def modify_audio(self, audio_data, sr):
-        """Apply pitch and tempo modifications to audio"""
-        try:
-            # Apply pitch shift
-            if self.pitch_factor != 1.0:
-                # Convert pitch factor to semitones
-                semitones = 12 * np.log2(self.pitch_factor)
-                audio_data = librosa.effects.pitch_shift(audio_data, sr=sr, n_steps=semitones)
-            
-            # Apply tempo change
-            if self.tempo_factor != 1.0:
-                audio_data = librosa.effects.time_stretch(audio_data, rate=self.tempo_factor)
-            
-            return audio_data
-        except Exception as e:
-            print(f"Audio modification error: {e}")
-            return audio_data
+    def audio_playback_loop(self):
+        """Continuous audio playback loop with real-time modifications"""
+        print("Starting audio playback loop...")
+        
+        while self.audio_playing:
+            try:
+                # Get next processed chunk
+                chunk = self.audio_processor.get_next_chunk()
+                
+                if chunk is not None and len(chunk) > 0:
+                    # Convert to pygame format
+                    chunk = np.clip(chunk, -1.0, 1.0)
+                    chunk = (chunk * 32767).astype(np.int16)
+                    
+                    # Create and play sound
+                    try:
+                        sound = pygame.sndarray.make_sound(chunk)
+                        channel = pygame.mixer.find_channel()
+                        if channel:
+                            channel.play(sound)
+                        else:
+                            # If no free channel, wait a bit
+                            time.sleep(0.01)
+                    except Exception as e:
+                        print(f"Pygame sound error: {e}")
+                        time.sleep(0.01)
+                
+                # Control playback rate
+                time.sleep(0.02)  # ~50 FPS audio updates
+                
+            except Exception as e:
+                print(f"Audio playback error: {e}")
+                time.sleep(0.1)
+        
+        print("Audio playback loop stopped")
     
     def load_audio(self, audio_file):
         """Load audio file"""
         try:
-            self.original_audio, self.original_sr = librosa.load(audio_file, sr=None)
+            self.original_audio, self.original_sr = librosa.load(audio_file, sr=22050)
+            self.audio_processor.load_audio(self.original_audio, self.original_sr)
             return True
         except Exception as e:
             print(f"Error loading audio: {e}")
             return False
     
-    def play_audio(self):
-        """Play modified audio in a loop"""
+    def start_audio(self):
+        """Start continuous audio playback"""
         if self.original_audio is None:
-            return
+            return False
         
-        while self.audio_playing:
-            try:
-                # Apply current modifications
-                modified_audio = self.modify_audio(self.original_audio.copy(), self.original_sr)
-                
-                # Convert to pygame format
-                modified_audio = np.clip(modified_audio, -1.0, 1.0)
-                modified_audio = (modified_audio * 32767).astype(np.int16)
-                
-                # Create pygame sound
-                sound_array = np.array([modified_audio, modified_audio]).T
-                sound = pygame.sndarray.make_sound(sound_array)
-                
-                # Play sound
-                pygame.mixer.stop()
-                pygame.mixer.Sound.play(sound)
-                
-                # Wait for sound to finish or parameters to change significantly
-                duration = len(modified_audio) / self.original_sr
-                sleep_time = max(0.1, duration / 10)  # Update frequently for responsiveness
-                time.sleep(sleep_time)
-                
-            except Exception as e:
-                print(f"Audio playback error: {e}")
-                time.sleep(0.1)
+        if self.audio_playing:
+            return True
+        
+        self.audio_playing = True
+        self.audio_thread = threading.Thread(target=self.audio_playback_loop)
+        self.audio_thread.daemon = True
+        self.audio_thread.start()
+        return True
+    
+    def stop_audio(self):
+        """Stop audio playback"""
+        self.audio_playing = False
+        pygame.mixer.stop()
+        if self.audio_thread:
+            self.audio_thread.join(timeout=1.0)
     
     def update_visualization(self):
         """Update real-time visualization"""
         current_time = time.time()
         
-        # Add current data to queues
         try:
             self.time_data.put_nowait(current_time)
             self.pitch_data.put_nowait(self.pitch_factor)
             self.tempo_data.put_nowait(self.tempo_factor)
         except queue.Full:
-            # Remove oldest data if queue is full
             try:
                 self.time_data.get_nowait()
                 self.pitch_data.get_nowait() 
@@ -198,21 +313,17 @@ class HandAudioController:
             except queue.Empty:
                 pass
         
-        # Convert queues to lists for plotting
         times = list(self.time_data.queue)
         pitches = list(self.pitch_data.queue)
         tempos = list(self.tempo_data.queue)
         
         if len(times) > 1:
-            # Normalize time to start from 0
             times = np.array(times) - times[0] if times else []
             
-            # Clear and update plots
             self.ax1.clear()
             self.ax2.clear()
             self.ax3.clear()
             
-            # Plot pitch factor
             self.ax1.plot(times, pitches, 'b-', linewidth=2, label='Pitch Factor')
             self.ax1.set_ylabel('Pitch Factor')
             self.ax1.set_title('Real-time Audio Modifications')
@@ -220,14 +331,12 @@ class HandAudioController:
             self.ax1.legend()
             self.ax1.set_ylim(self.pitch_range[0] - 0.1, self.pitch_range[1] + 0.1)
             
-            # Plot tempo factor
             self.ax2.plot(times, tempos, 'r-', linewidth=2, label='Tempo Factor')
             self.ax2.set_ylabel('Tempo Factor')
             self.ax2.grid(True, alpha=0.3)
             self.ax2.legend()
             self.ax2.set_ylim(self.tempo_range[0] - 0.1, self.tempo_range[1] + 0.1)
             
-            # Plot hand distances
             left_distances = [self.left_hand_distance] * len(times)
             right_distances = [self.right_hand_distance] * len(times)
             
@@ -239,7 +348,6 @@ class HandAudioController:
             self.ax3.legend()
             self.ax3.set_ylim(0, self.max_distance + 0.02)
         
-        # Save plot as base64 image
         canvas = FigureCanvasAgg(self.fig)
         png_output = io.BytesIO()
         canvas.print_png(png_output)
@@ -268,15 +376,14 @@ class HandAudioController:
         if not ret:
             return None
         
-        # Process hands and get modified frame
         processed_frame = self.process_hands(frame)
         
-        # Add info text
         info_text = [
             f"Pitch Factor: {self.pitch_factor:.2f} (Left Hand)",
             f"Tempo Factor: {self.tempo_factor:.2f} (Right Hand)",
             f"Left Distance: {self.left_hand_distance:.3f}",
-            f"Right Distance: {self.right_hand_distance:.3f}"
+            f"Right Distance: {self.right_hand_distance:.3f}",
+            f"Audio Playing: {'Yes' if self.audio_playing else 'No'}"
         ]
         
         for i, text in enumerate(info_text):
@@ -303,13 +410,11 @@ def upload_audio():
         if audio_file.filename == '':
             return jsonify({'error': 'No audio file selected'}), 400
         
-        # Save temporarily and load
         temp_path = f"temp_audio_{int(time.time())}.wav"
         audio_file.save(temp_path)
         
         success = controller.load_audio(temp_path)
         
-        # Clean up temp file
         import os
         try:
             os.remove(temp_path)
@@ -331,12 +436,11 @@ def start_audio():
         if controller.original_audio is None:
             return jsonify({'error': 'No audio loaded'}), 400
         
-        controller.audio_playing = True
-        audio_thread = threading.Thread(target=controller.play_audio)
-        audio_thread.daemon = True
-        audio_thread.start()
-        
-        return jsonify({'message': 'Audio playback started'})
+        success = controller.start_audio()
+        if success:
+            return jsonify({'message': 'Audio playback started'})
+        else:
+            return jsonify({'error': 'Failed to start audio'}), 500
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -344,8 +448,7 @@ def start_audio():
 def stop_audio():
     """Stop audio playback"""
     try:
-        controller.audio_playing = False
-        pygame.mixer.stop()
+        controller.stop_audio()
         return jsonify({'message': 'Audio playback stopped'})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -376,7 +479,6 @@ def generate_frames():
     while controller.camera_running:
         frame = controller.get_frame()
         if frame is not None:
-            # Encode frame as JPEG
             ret, buffer = cv2.imencode('.jpg', frame)
             if ret:
                 frame_bytes = buffer.tobytes()
@@ -421,7 +523,7 @@ def health():
     return jsonify({'status': 'healthy'})
 
 if __name__ == '__main__':
-    print("Starting Hand Gesture Audio Controller Backend...")
+    print("Starting Real-time Hand Gesture Audio Controller Backend...")
     print("Available endpoints:")
     print("- POST /upload_audio - Upload audio file")
     print("- POST /start_audio - Start audio playback")
