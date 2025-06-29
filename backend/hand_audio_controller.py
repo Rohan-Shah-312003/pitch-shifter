@@ -6,7 +6,6 @@ import pyrubberband as pyrb
 import pygame
 import threading
 import time
-import json
 from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
 import io
@@ -21,7 +20,7 @@ from collections import deque
 class RealTimeAudioProcessor:
     def __init__(self, chunk_size=2048):
         self.chunk_size = chunk_size
-        self.overlap_size = chunk_size // 4  # 25% overlap for smoother transitions
+        self.overlap_size = chunk_size // 8  # 25% overlap for smoother transitions
         self.audio_buffer = deque()
         self.processed_buffer = deque()
         self.overlap_buffer = np.zeros(self.overlap_size)
